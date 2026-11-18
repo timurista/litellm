@@ -131,6 +131,7 @@ from .long_decode import (
     LongDecodeHops,
     StreamResume,
     SyncStreamResume,
+    _asks_for_one_candidate,
     answer_bytes,
     client_continuation_token,
     collect_hops_async,
@@ -4200,6 +4201,16 @@ def _transform_long_decode_hops(
     return merged if marked is merged_usage else merged.model_copy(update={"usage": marked})
 
 
+_FAILED_TOOL_CALL_FINISH_REASONS: Final = frozenset({"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"})
+
+
+def _clear_finish_fields(choices: Sequence["StreamingChoices"]) -> None:
+    for choice in choices:
+        choice.finish_reason = None
+        if hasattr(choice, "provider_specific_fields"):
+            delattr(choice, "provider_specific_fields")
+
+
 def _provider_finish_reasons(
     candidates: Sequence[Candidates], choices: Sequence["StreamingChoices"], blocked_indices: frozenset[int]
 ) -> tuple[tuple[int, str], ...]:
@@ -4247,6 +4258,10 @@ class ModelResponseIterator:
         self.has_seen_tool_calls: bool = False
         self._resume = resume
         self._output_cap = continuation_cap_of(resume.request_body) if resume is not None else None
+        self._asked_for_one_candidate: Final = resume is not None and _asks_for_one_candidate(
+            resume.request_body.get("generationConfig") or {}
+        )
+        self._failed_tool_call_reason: str | None = None
         self._pending_hop_token: str | None = None
         self._unanswered_hop_token: str | None = None
         self._first_response_id: str | None = None
@@ -4354,6 +4369,8 @@ class ModelResponseIterator:
                 if choice.finish_reason == "stop":
                     choice.finish_reason = "tool_calls"
 
+        self._hold_back_failed_tool_call_finish(_candidates, model_response)
+
         VertexGeminiConfig.set_stream_metadata_on_response(
             model_response,
             grounding_metadata,
@@ -4368,6 +4385,35 @@ class ModelResponseIterator:
             safety_ratings,
             citation_metadata,
         )
+
+    def _hold_back_failed_tool_call_finish(
+        self, candidates: Sequence[Candidates], model_response: "ModelResponseStream"
+    ) -> None:
+        if self.has_seen_tool_calls:
+            self._failed_tool_call_reason = None
+            return
+        if not self._asked_for_one_candidate or len(candidates) != 1 or not _names_its_finish(candidates[0]):
+            return
+        reason: Final = candidates[0].get("finishReason")
+        if reason is None or reason not in _FAILED_TOOL_CALL_FINISH_REASONS:
+            self._failed_tool_call_reason = None
+            return
+        self._failed_tool_call_reason = reason
+        _clear_finish_fields(model_response.choices)
+
+    def _next_hop_token_at_stream_end(self) -> str | None:
+        token: Final = self._pending_hop_token
+        if token is not None:
+            self._pending_hop_token = None
+            self._failed_tool_call_reason = None
+            return token
+        if self._failed_tool_call_reason is not None:
+            raise VertexAIError(
+                status_code=500,
+                message=f"Gemini ended the stream with finish reason {self._failed_tool_call_reason} "
+                "instead of a usable tool call",
+            )
+        return None
 
     def _marked_stream_usage(self, usage: Usage | None) -> Usage | None:
         if usage is None or not self._usage_offset:
@@ -4509,11 +4555,9 @@ class ModelResponseIterator:
             return
         self._pending_hop_token = token
         self._first_response_id = self._first_response_id or processed_chunk.get("responseId")
+        _clear_finish_fields(model_response.choices)
         for choice in model_response.choices:
             delta_fields: Mapping[str, object] = choice.delta.provider_specific_fields or {}
-            choice.finish_reason = None
-            if hasattr(choice, "provider_specific_fields"):
-                delattr(choice, "provider_specific_fields")
             choice.delta.provider_specific_fields = {
                 key: value for key, value in delta_fields.items() if key != "continuation_token"
             } or None
@@ -4671,9 +4715,8 @@ class ModelResponseIterator:
                         return result
                 if (unanswered_end := self._end_of_unanswered_hop()) is not None:
                     return unanswered_end
-                if (token := self._pending_hop_token) is None:
+                if (token := self._next_hop_token_at_stream_end()) is None:
                     raise StopIteration
-                self._pending_hop_token = None
                 if (truncated_end := self._open_next_hop_sync(token)) is not None:
                     return truncated_end
                 continue
@@ -4712,9 +4755,8 @@ class ModelResponseIterator:
                         return result
                 if (unanswered_end := self._end_of_unanswered_hop()) is not None:
                     return unanswered_end
-                if (token := self._pending_hop_token) is None:
+                if (token := self._next_hop_token_at_stream_end()) is None:
                     raise StopAsyncIteration
-                self._pending_hop_token = None
                 if (truncated_end := await self._open_next_hop_async(token)) is not None:
                     return truncated_end
                 continue

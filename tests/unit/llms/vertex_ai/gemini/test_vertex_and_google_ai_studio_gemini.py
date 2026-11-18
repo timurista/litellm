@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain, pairwise
@@ -19,6 +19,7 @@ import litellm
 from litellm import ModelResponse, completion, embedding, image_generation
 from litellm._logging import verbose_logger
 from litellm.cost_calculator import batch_cost_calculator
+from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token, parse_prompt_tokens_details
@@ -27,8 +28,10 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.gemini.chat.transformation import GoogleAIStudioGeminiConfig
 from litellm.llms.vertex_ai.common_utils import GEMINI_MAX_ENUM_CHARACTERS, VertexAIError
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+from litellm.llms.vertex_ai.gemini.long_decode import AsyncStreamResume, SyncStreamResume
 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
     OPENAI_TO_GEMINI_TTS_VOICES,
+    ModelResponseIterator,
     VertexGeminiConfig,
     _log_gemini_sampling_params_deprecated,
     normalize_gemini_speech_config,
@@ -8324,9 +8327,9 @@ _GOOGLE_NOTE_OUTCOMES: Final = (
     pytest.param(_blocked_outcome("PROHIBITED_CONTENT", "Prompt was blocked."), id="blocked_with_note"),
     pytest.param(
         _finished_after_text_outcome(
-            "MALFORMED_FUNCTION_CALL", "stop", "Malformed function call: print(default_api.lookup(city='Paris'"
+            "MALFORMED_RESPONSE", "stop", "Malformed function call: print(default_api.lookup(city='Paris'"
         ),
-        id="malformed_function_call_with_note",
+        id="malformed_response_with_note",
     ),
 )
 _GOOGLE_REASON_OUTCOMES: Final = (
@@ -8334,7 +8337,7 @@ _GOOGLE_REASON_OUTCOMES: Final = (
     pytest.param(_flagged_outcome("RECITATION"), id="flagged_without_note"),
     pytest.param(_blocked_outcome("SAFETY"), id="blocked_without_note"),
     pytest.param(_finished_after_text_outcome("STOP", "stop"), id="stop"),
-    pytest.param(_finished_after_text_outcome("MALFORMED_FUNCTION_CALL", "stop"), id="malformed_function_call"),
+    pytest.param(_finished_after_text_outcome("MALFORMED_RESPONSE", "stop"), id="malformed_response"),
 )
 
 
@@ -11929,3 +11932,251 @@ def test_grounding_support_preserves_every_web_source(chunk_indices: list[int]) 
         }
         for index, start, end in expected_sources
     ]
+
+
+_STREAM_MODES: Final = pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+_FAILED_TOOL_CALL_REASONS: Final = ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+_FAILED_TOOL_CALL_NOTE: Final = "print(default_api.lookup(city='Paris'"
+_TOOL_CALL_FRAME: Final = {
+    "candidates": [
+        {
+            "content": {"role": "model", "parts": [{"functionCall": {"name": "lookup", "args": {"city": "Paris"}}}]},
+            "index": 0,
+        }
+    ]
+}
+_STOP_FRAME: Final = _google_finished({"finishReason": "STOP"})
+_CONTINUATION_FRAME: Final = _google_finished({"finishReason": "CONTINUATION", "continuationToken": "next-hop"})
+
+
+def _google_last_frame(reason: str) -> Mapping[str, object]:
+    return _google_finished(
+        {
+            "content": {"role": "model", "parts": [{"text": "silver light."}]},
+            "finishReason": reason,
+            "finishMessage": _FAILED_TOOL_CALL_NOTE,
+        }
+    )
+
+
+_FAILED_TOOL_CALL_FRAME: Final = _google_last_frame("MALFORMED_FUNCTION_CALL")
+_FAILED_TOOL_CALL_FRAMES: Final = (_google_text_frame("Waves fold "), _FAILED_TOOL_CALL_FRAME)
+
+
+@dataclass(frozen=True, slots=True)
+class _GeminiStreamEnd:
+    chunks: tuple[ModelResponseStream, ...]
+    error: Exception | None
+
+
+def _items_until_error(stream: Iterable[object], error_type: type[Exception]) -> Iterator[object]:
+    try:
+        yield from stream
+    except error_type as error:
+        yield error
+
+
+async def _async_items_until_error(stream: AsyncIterable[object], error_type: type[Exception]) -> AsyncIterator[object]:
+    try:
+        async for item in stream:
+            yield item
+    except error_type as error:
+        yield error
+
+
+async def _stream_end(stream: object, is_async: bool, error_type: type[Exception]) -> _GeminiStreamEnd:
+    items: Final = (
+        tuple([item async for item in _async_items_until_error(stream, error_type)])
+        if is_async
+        else tuple(_items_until_error(stream, error_type))
+    )
+    errors: Final = tuple(item for item in items if isinstance(item, error_type))
+    return _GeminiStreamEnd(
+        chunks=tuple(item for item in items if isinstance(item, ModelResponseStream)),
+        error=errors[0] if errors else None,
+    )
+
+
+async def _async_lines(lines: Sequence[str]) -> AsyncIterator[str]:
+    for line in lines:
+        yield line
+
+
+def _hop_response(frames: Sequence[Mapping[str, object]]) -> httpx.Response:
+    return httpx.Response(200, content="".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode())
+
+
+def _gemini_iterator(
+    frames: Sequence[Mapping[str, object]],
+    is_async: bool,
+    generation_config: Mapping[str, int] | None = None,
+    hop_frames: Sequence[Mapping[str, object]] = (),
+) -> ModelResponseIterator:
+    lines: Final = tuple(f"data: {json.dumps(frame)}" for frame in frames)
+    request_body: Final = RequestBody(contents=[], generationConfig=dict(generation_config or {}))
+
+    async def open_hop_async(_: RequestBody) -> httpx.Response:
+        return _hop_response(hop_frames)
+
+    return ModelResponseIterator(
+        streaming_response=_async_lines(lines) if is_async else iter(lines),
+        sync_stream=not is_async,
+        logging_obj=MagicMock(optional_params={}),
+        resume=(
+            AsyncStreamResume(request_body=request_body, open_hop=open_hop_async)
+            if is_async
+            else SyncStreamResume(request_body=request_body, open_hop=lambda _: _hop_response(hop_frames))
+        ),
+    )
+
+
+async def _drain_gemini_stream(
+    frames: Sequence[Mapping[str, object]],
+    is_async: bool,
+    generation_config: Mapping[str, int] | None = None,
+    hop_frames: Sequence[Mapping[str, object]] = (),
+) -> _GeminiStreamEnd:
+    iterator: Final = _gemini_iterator(frames, is_async, generation_config, hop_frames)
+    return await _stream_end(iterator, is_async, VertexAIError)
+
+
+def _streamed_text(chunks: Sequence[ModelResponseStream]) -> str:
+    return "".join(choice.delta.content or "" for choice in _stream_choices(chunks))
+
+
+async def _assert_failed_tool_call_stream_raises(is_async: bool) -> None:
+    assert (await _drain_gemini_stream(_FAILED_TOOL_CALL_FRAMES, is_async)).error is not None
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", _FAILED_TOOL_CALL_REASONS)
+async def test_stream_ending_in_failed_tool_call_raises_after_delivering_text_and_usage(
+    reason: str, is_async: bool
+) -> None:
+    end: Final = await _drain_gemini_stream((_google_text_frame("Waves fold "), _google_last_frame(reason)), is_async)
+
+    assert isinstance(end.error, VertexAIError)
+    assert end.error.status_code == 500
+    assert reason in end.error.message
+    assert _FAILED_TOOL_CALL_NOTE not in end.error.message
+    assert _streamed_text(end.chunks) == "Waves fold silver light."
+    last_chunk: Final = end.chunks[-1]
+    assert last_chunk.choices[0].finish_reason is None
+    assert (last_chunk.usage.prompt_tokens, last_chunk.usage.completion_tokens, last_chunk.usage.total_tokens) == (
+        11,
+        5,
+        16,
+    )
+
+
+@_STREAM_MODES
+async def test_caller_gets_text_then_an_error_and_no_finish_when_the_tool_call_fails(is_async: bool) -> None:
+    outcome: Final = _finished_after_text_outcome("MALFORMED_FUNCTION_CALL", "stop", _FAILED_TOOL_CALL_NOTE)
+    transport: Final = httpx.MockTransport(_google_reason_handler(outcome))
+    request: Final = {
+        "model": "gemini/gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Describe the sea."}],
+        "stream": True,
+        "api_key": "fake-gemini-key",
+    }
+    stream: Final = (
+        await litellm.acompletion(**request, client=AsyncHTTPHandler(transport=transport))
+        if is_async
+        else litellm.completion(**request, client=HTTPHandler(client=httpx.Client(transport=transport)))
+    )
+
+    end: Final = await _stream_end(stream, is_async, MidStreamFallbackError)
+
+    assert isinstance(end.error, MidStreamFallbackError)
+    assert end.error.status_code == 500
+    assert "MALFORMED_FUNCTION_CALL" in str(end.error)
+    assert _FAILED_TOOL_CALL_NOTE not in str(end.error)
+    assert _streamed_text(end.chunks) == outcome.text
+    assert _finish_choices(end.chunks) == ()
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", _FAILED_TOOL_CALL_REASONS)
+async def test_tool_call_followed_by_failed_reason_still_finishes_as_tool_calls(reason: str, is_async: bool) -> None:
+    await _assert_failed_tool_call_stream_raises(is_async)
+
+    end: Final = await _drain_gemini_stream((_TOOL_CALL_FRAME, _google_finished({"finishReason": reason})), is_async)
+
+    assert end.error is None
+    assert end.chunks[-1].choices[0].finish_reason == "tool_calls"
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", ["MALFORMED_RESPONSE", "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "STOP"])
+async def test_other_finish_reasons_end_the_stream_normally(reason: str, is_async: bool) -> None:
+    await _assert_failed_tool_call_stream_raises(is_async)
+
+    end: Final = await _drain_gemini_stream((_google_text_frame("Waves fold "), _google_last_frame(reason)), is_async)
+
+    assert end.error is None
+    assert end.chunks[-1].choices[0].finish_reason == "stop"
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("count_key", ["candidate_count", "candidateCount"])
+async def test_request_for_several_candidates_keeps_the_normal_finish(count_key: str, is_async: bool) -> None:
+    await _assert_failed_tool_call_stream_raises(is_async)
+
+    end: Final = await _drain_gemini_stream(_FAILED_TOOL_CALL_FRAMES, is_async, {count_key: 2})
+
+    assert end.error is None
+    assert end.chunks[-1].choices[0].finish_reason == "stop"
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize(
+    "later_frame",
+    [pytest.param(_TOOL_CALL_FRAME, id="tool_call"), pytest.param(_STOP_FRAME, id="normal_finish")],
+)
+async def test_later_frame_clears_a_remembered_tool_call_failure(
+    later_frame: Mapping[str, object], is_async: bool
+) -> None:
+    await _assert_failed_tool_call_stream_raises(is_async)
+
+    end: Final = await _drain_gemini_stream((*_FAILED_TOOL_CALL_FRAMES, later_frame), is_async)
+
+    assert end.error is None
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize(
+    ("frames", "hop_frames", "finish_reason"),
+    [
+        pytest.param((_FAILED_TOOL_CALL_FRAME, _CONTINUATION_FRAME), (_STOP_FRAME,), "stop", id="failure_then_hop"),
+        pytest.param((_CONTINUATION_FRAME, _FAILED_TOOL_CALL_FRAME), (), "length", id="hop_then_failure_then_no_reply"),
+    ],
+)
+async def test_continuation_hop_drops_a_remembered_tool_call_failure(
+    frames: tuple[Mapping[str, object], ...],
+    hop_frames: tuple[Mapping[str, object], ...],
+    finish_reason: str,
+    is_async: bool,
+) -> None:
+    await _assert_failed_tool_call_stream_raises(is_async)
+
+    end: Final = await _drain_gemini_stream(frames, is_async, {"max_output_tokens": 1000}, hop_frames)
+
+    assert end.error is None
+    assert end.chunks[-1].choices[0].finish_reason == finish_reason
+
+
+def test_pass_through_log_parser_keeps_the_finish_of_a_failed_tool_call() -> None:
+    from litellm.proxy.pass_through_endpoints.llm_provider_handlers.vertex_passthrough_logging_handler import (
+        GeminiSseChunkParser,
+    )
+
+    line: Final = f"data: {json.dumps(_FAILED_TOOL_CALL_FRAME)}"
+    streamed: Final = _gemini_iterator((), is_async=False)._common_chunk_parsing_logic(line)
+    assert streamed.choices[0].finish_reason is None
+
+    parsed: Final = GeminiSseChunkParser(
+        streaming_response=None, sync_stream=False, logging_obj=MagicMock(optional_params={})
+    ).parse_sse_chunk(line)
+
+    assert parsed.choices[0].finish_reason == "stop"
+    assert parsed.choices[0].provider_specific_fields == {"native_finish_reason": "MALFORMED_FUNCTION_CALL"}

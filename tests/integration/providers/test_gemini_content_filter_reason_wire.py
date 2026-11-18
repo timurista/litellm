@@ -149,9 +149,9 @@ _FLAGGED_WITH_NOTE: Final = _flagged("SAFETY", "The candidate was blocked for sa
 _BLOCKED: Final = _blocked("SAFETY")
 _BLOCKED_WITH_NOTE: Final = _blocked("PROHIBITED_CONTENT", "The prompt was blocked.")
 _ANSWERED: Final = _finished_after_text("STOP", "stop")
-_MALFORMED: Final = _finished_after_text("MALFORMED_FUNCTION_CALL", "stop")
+_MALFORMED: Final = _finished_after_text("MALFORMED_RESPONSE", "stop")
 _MALFORMED_WITH_NOTE: Final = _finished_after_text(
-    "MALFORMED_FUNCTION_CALL", "stop", "Malformed function call: print(default_api.lookup(city='Paris'"
+    "MALFORMED_RESPONSE", "stop", "Malformed function call: print(default_api.lookup(city='Paris'"
 )
 _UPSTREAMS: Final = (
     *_FLAGGED.values(),
