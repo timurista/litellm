@@ -97,6 +97,14 @@ def _ocr_health_check_document(model: str, custom_llm_provider: str) -> Document
     return native(model, custom_llm_provider)
 
 
+def _responses_probe_params(model_params: Mapping[str, object]) -> Mapping[str, object]:
+    max_tokens: Final = model_params.get("max_tokens")
+    params: Final = {k: v for k, v in model_params.items() if k != "max_tokens"}
+    if max_tokens is None or params.get("max_output_tokens") is not None:
+        return params
+    return {**params, "max_output_tokens": max_tokens}
+
+
 def _provider_base_model(custom_llm_provider: str, model: str) -> str | None:
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
@@ -372,7 +380,7 @@ class HealthCheckHelpers:
                 filtered_model_params=_filter_model_params(model_params=model_params),
             ),
             "responses": lambda: litellm.aresponses(
-                **_filter_model_params(model_params=model_params),
+                **_responses_probe_params(_filter_model_params(model_params=model_params)),
                 input=prompt or "test",
             ),
             "anthropic_messages": lambda: litellm.anthropic_messages(
