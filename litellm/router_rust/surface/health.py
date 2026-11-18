@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Final, Literal
 
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.litellm_core_utils.unusable_tool_call_failure import is_unusable_tool_call_failure
 
 if TYPE_CHECKING:
     from litellm.router_rust.steps.callbacks import OptionalChecks
@@ -384,6 +385,7 @@ class RustHealthCallbacks:
         exception_status: Final[object] = getattr(exception, "status_code", "")
         if (
             is_advisor_orchestration_failure(exception)
+            or is_unusable_tool_call_failure(exception)
             or is_stream_stall(exception)
             or (generic and cast_exception_status_to_int(exception_status) in _REQUEST_SCOPED_STATUS_CODES)  # pyright: ignore[reportArgumentType]  # the status as raised
             or is_caller_timeout_408(model_call_details, exception_status, ended=datetime.now())  # pyright: ignore[reportArgumentType]  # noqa: DTZ005  # see logged_call

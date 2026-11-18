@@ -21,6 +21,7 @@ from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.litellm_core_utils.litellm_logging import mask_api_base_credentials
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.router_cooldowns import RouterCooldowns, RouterCooldownStore
 from litellm.router_api import RoutingContext
@@ -1335,6 +1336,28 @@ def test_should_run_cooldown_logic(testing_litellm_router):
         _should_run_cooldown_logic(RoutingContext(testing_litellm_router), "test_deployment", 500, Exception("Test"))
         is False
     )
+
+
+@pytest.mark.parametrize(("marked", "runs_cooldown"), [(True, False), (False, True)], ids=["marked", "ordinary-500"])
+def test_cooldown_logic_skips_only_a_marked_tool_call_failure(marked: bool, runs_cooldown: bool) -> None:
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "gemini",
+                "litellm_params": {"model": "gemini/gemini-3.8-flash", "api_key": "fake"},
+                "model_info": {"id": "deployment-a"},
+            }
+        ]
+    )
+    error: Final = litellm.InternalServerError(
+        message="Gemini ended the stream with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
+        llm_provider="vertex_ai",
+        model="gemini-3.8-flash",
+    )
+    if marked:
+        mark_unusable_tool_call_failure(error)
+
+    assert _should_run_cooldown_logic(RoutingContext(router), "deployment-a", 500, error) is runs_cooldown
 
 
 @pytest.fixture

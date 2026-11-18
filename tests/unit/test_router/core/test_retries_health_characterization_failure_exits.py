@@ -15,6 +15,9 @@ import pytest
 
 import litellm
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
+from litellm.exceptions import MidStreamFallbackError
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.router_core import RouterCore
 from litellm.router_utils.cooldown_handlers import mark_deployment_selection_failure
 from litellm.types.router import AllowedFailsPolicy
@@ -58,6 +61,26 @@ def selection_failure() -> Exception:
     return error
 
 
+def unusable_tool_call_failure() -> litellm.InternalServerError:
+    error: Final = server_error()
+    mark_unusable_tool_call_failure(error)
+    return error
+
+
+def wrapped_unusable_tool_call_failure() -> MidStreamFallbackError:
+    return MidStreamFallbackError(
+        message="cut", model="gpt-4o", llm_provider="openai", original_exception=unusable_tool_call_failure()
+    )
+
+
+def server_error_worded_like_a_tool_call_failure() -> litellm.InternalServerError:
+    return litellm.InternalServerError(
+        message="Gemini ended the stream with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
+        llm_provider="vertex_ai",
+        model="gemini-3.8-flash",
+    )
+
+
 def caller_auth_error() -> Exception:
     return litellm.CallerCredentialAuthenticationError(
         message="not connected", llm_provider="github_copilot", model="gpt-4o"
@@ -87,8 +110,12 @@ async def settle() -> None:
 
 @pytest.mark.parametrize(
     ("builder", "params"),
-    [(selection_failure, {}), (auth_error, {"token_exchange_endpoint": TOKEN_EXCHANGE})],
-    ids=["selection-failure", "caller-scoped-oauth"],
+    [
+        (selection_failure, {}),
+        (auth_error, {"token_exchange_endpoint": TOKEN_EXCHANGE}),
+        (unusable_tool_call_failure, {}),
+    ],
+    ids=["selection-failure", "caller-scoped-oauth", "unusable-tool-call"],
 )
 @pytest.mark.asyncio
 async def test_an_attempt_failure_outside_the_deployment_is_neither_counted_nor_cooled(
@@ -105,8 +132,12 @@ async def test_an_attempt_failure_outside_the_deployment_is_neither_counted_nor_
 
 @pytest.mark.parametrize(
     ("builder", "params"),
-    [(selection_failure, {}), (auth_error, {"token_exchange_endpoint": TOKEN_EXCHANGE})],
-    ids=["selection-failure", "caller-scoped-oauth"],
+    [
+        (selection_failure, {}),
+        (auth_error, {"token_exchange_endpoint": TOKEN_EXCHANGE}),
+        (unusable_tool_call_failure, {}),
+    ],
+    ids=["selection-failure", "caller-scoped-oauth", "unusable-tool-call"],
 )
 def test_a_sync_attempt_failure_outside_the_deployment_is_neither_counted_nor_cooled(
     make_core: MakeCore, host: ScriptedHost, builder: ErrorBuilder, params: dict[str, object]
@@ -171,18 +202,125 @@ def test_a_sync_stream_failure_outside_the_deployment_is_neither_counted_nor_coo
     assert core.health().failures_this_minute("a") == 0
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [selection_failure, unusable_tool_call_failure, wrapped_unusable_tool_call_failure],
+    ids=["selection-failure", "unusable-tool-call", "wrapped-unusable-tool-call"],
+)
 @pytest.mark.asyncio
 async def test_the_failure_hook_counts_a_failure_outside_the_deployment_as_nothing(
-    make_core: MakeCore, host: ScriptedHost
+    make_core: MakeCore, host: ScriptedHost, builder: ErrorBuilder
 ) -> None:
     core: Final = make_core(model_list=group("a", "b"), num_retries=0, allowed_fails=0)
     logged: Final = {
-        "exception": selection_failure(),
+        "exception": builder(),
         "litellm_params": {"metadata": {"model_group": "g"}, "model_info": {"id": "a"}},
     }
 
     assert core.deployment_callback_on_failure(logged, None, None, None) is False  # pyright: ignore[reportAttributeAccessIssue]  # every core serves it
     assert core.health().failures_this_minute("a") == 0
+
+
+@pytest.mark.parametrize(
+    ("builder", "failures", "cooled"),
+    [(unusable_tool_call_failure, 0, set()), (server_error_worded_like_a_tool_call_failure, 1, {"a"})],
+    ids=["unusable-tool-call", "ordinary-500"],
+)
+@pytest.mark.asyncio
+async def test_only_a_marked_tool_call_failure_keeps_a_stream_off_the_deployment(
+    make_core: MakeCore, host: ScriptedHost, builder: ErrorBuilder, failures: int, cooled: set[str]
+) -> None:
+    host.answer("openai/a", chat_stream("partial", error=builder(), logged=True))
+    core: Final = make_core(
+        model_list=[deployment("g", "a", order=1), deployment("g", "b", order=2)], num_retries=0, allowed_fails=0
+    )
+
+    stream: Final = await core.acompletion(model="g", messages=MESSAGES, stream=True)  # pyright: ignore[reportAttributeAccessIssue]  # every core serves acompletion
+    with pytest.raises(litellm.InternalServerError):
+        await collect_texts(stream)
+    await settle()
+
+    assert core.health().failures_this_minute("a") == failures
+    assert set(cooled_down(core, ["a", "b"])) == cooled
+
+
+@pytest.mark.parametrize(
+    ("builder", "failures", "cooled"),
+    [(unusable_tool_call_failure, 0, set()), (server_error_worded_like_a_tool_call_failure, 1, {"a"})],
+    ids=["unusable-tool-call", "ordinary-500"],
+)
+def test_only_a_marked_tool_call_failure_keeps_a_sync_stream_off_the_deployment(
+    make_core: MakeCore, host: ScriptedHost, builder: ErrorBuilder, failures: int, cooled: set[str]
+) -> None:
+    host.answer("openai/a", chat_stream("partial", error=builder(), logged=True, sync=True))
+    core: Final = make_core(
+        model_list=[deployment("g", "a", order=1), deployment("g", "b", order=2)], num_retries=0, allowed_fails=0
+    )
+
+    stream: Final = core.completion(model="g", messages=MESSAGES, stream=True)  # pyright: ignore[reportAttributeAccessIssue]  # every core serves completion
+    with pytest.raises(litellm.InternalServerError):
+        collect_texts_sync(stream)
+
+    assert core.health().failures_this_minute("a") == failures
+    assert set(cooled_down(core, ["a", "b"])) == cooled
+
+
+@pytest.mark.asyncio
+async def test_a_500_worded_like_a_tool_call_failure_still_counts_against_the_deployment(
+    make_core: MakeCore, host: ScriptedHost
+) -> None:
+    core: Final = make_core(
+        model_list=[deployment("g", "a", order=1), deployment("g", "b", order=2)], num_retries=0, allowed_fails=0
+    )
+    host.answer("*", fresh(server_error_worded_like_a_tool_call_failure))
+
+    await attempt(core)
+
+    assert core.health().failures_this_minute("a") == 1
+    assert "a" in cooled_down(core, ["a", "b"])
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_tool_call_failure_is_still_retried_and_falls_back(
+    make_core: MakeCore, host: ScriptedHost
+) -> None:
+    core: Final = make_core(
+        model_list=[deployment("g", "a"), deployment("f", "z")], num_retries=1, fallbacks=[{"g": ["f"]}]
+    )
+    host.answer("openai/a", fresh(unusable_tool_call_failure))
+
+    await attempt(core)
+
+    assert host.deployments_called("acompletion") == ["a", "a", "z"]
+
+
+@pytest.mark.parametrize(
+    ("builder", "cooled"),
+    [(unusable_tool_call_failure, set()), (server_error_worded_like_a_tool_call_failure, {"a"})],
+    ids=["unusable-tool-call", "ordinary-500"],
+)
+def test_a_fallback_hop_blocked_from_logging_cools_down_only_for_an_ordinary_failure(
+    make_core: MakeCore, builder: ErrorBuilder, cooled: set[str]
+) -> None:
+    core: Final = make_core(model_list=group("a", "b"), num_retries=0, allowed_fails=0)
+    logging_obj: Final = Logging(
+        model="gpt-4o",
+        messages=MESSAGES,
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="call-1",
+        function_id="fn-1",
+    )
+    logging_obj.model_call_details["current_attempt_api_call_start_time"] = datetime(2026, 1, 1)
+    logging_obj.mark_logging_complete("async_failure")
+    logging_obj.model_call_details["current_attempt_api_call_start_time"] = datetime(2026, 1, 3)
+    error: Final = builder()
+    error.failed_deployment_id = "a"
+
+    core.trigger_fallback_cooldown({"litellm_logging_obj": logging_obj}, error, generic=False, own_loop=True)  # pyright: ignore[reportAttributeAccessIssue]  # every core serves it
+
+    assert set(cooled_down(core, ["a", "b"])) == cooled
 
 
 # --- N13: _should_run_cooldown_logic's per-caller exits ---------------------------------------------

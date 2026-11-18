@@ -19,6 +19,7 @@ import litellm
 from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.llms.custom_httpx.http_handler import MaskedHTTPStatusError
 from litellm.llms.vertex_ai.common_utils import VertexAIError
 from litellm.router_core import RouterCore
@@ -460,6 +461,20 @@ async def test_continuation_continues_after_content_on_a_prefill_capable_fallbac
     stream = await open_stream(core)
     assert await collect_texts(stream) == "hello world"
     assert host.deployments_called() == ["a", "b"]
+
+
+async def test_continuation_raises_an_unusable_tool_call_failure_instead_of_hiding_it(
+    make_core: MakeCore, host: ScriptedHost
+) -> None:
+    failure: Final = server_error()
+    mark_unusable_tool_call_failure(failure)
+    host.answer("openai/a", chat_stream("he", "llo", error=failure))
+    host.answer(PREFILL_MODEL, chat_stream(" world"))
+    core = continuation_core(make_core)
+    stream = await open_stream(core)
+    with pytest.raises(litellm.InternalServerError):
+        await collect_texts(stream)
+    assert host.deployments_called() == ["a"]
 
 
 async def test_continuation_sends_the_partial_text_as_an_assistant_prefill(

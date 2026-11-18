@@ -20,6 +20,7 @@ import pytest
 import litellm
 from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.router_core import RouterCore
 from litellm.types.llms.openai import (
@@ -295,6 +296,32 @@ async def test_after_text_a_content_policy_cut_raises_instead_of_continuing(
     with pytest.raises(litellm.ContentPolicyViolationError):
         await collect_event_types(stream)
     assert host.deployments_called() == ["a"]
+
+
+async def test_after_text_an_unusable_tool_call_failure_raises_instead_of_continuing(
+    make_core: MakeCore, host: ScriptedHost
+) -> None:
+    failure: Final = server_error()
+    mark_unusable_tool_call_failure(failure)
+    host.answer("openai/a", responses_stream(Event(CREATED), Event(TEXT_DELTA), error=cut("hel", failure)))
+    host.answer("openai/b", fallback_ok())
+    core = build(make_core)
+    stream = await open_stream(core)
+    with pytest.raises(litellm.InternalServerError):
+        await collect_event_types(stream)
+    assert host.deployments_called() == ["a"]
+
+
+async def test_before_any_output_an_unusable_tool_call_failure_still_falls_back(
+    make_core: MakeCore, host: ScriptedHost
+) -> None:
+    failure: Final = server_error()
+    mark_unusable_tool_call_failure(failure)
+    host.answer("openai/a", responses_stream(Event(CREATED), error=cut("", failure)))
+    host.answer("openai/b", fallback_ok())
+    core = build(make_core)
+    await collect_event_types(await open_stream(core))
+    assert host.deployments_called() == ["a", "b"]
 
 
 async def test_after_a_tool_call_began_the_primary_error_is_raised(make_core: MakeCore, host: ScriptedHost) -> None:

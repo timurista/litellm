@@ -20,6 +20,7 @@ from litellm.litellm_core_utils.bug_report import (
 )
 from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_or_none, json_contains, subscript
 from litellm.litellm_core_utils.secret_redaction import redact_string as redact_secret_string
+from litellm.litellm_core_utils.unusable_tool_call_failure import carry_unusable_tool_call_mark
 from litellm.llms.bedrock.common_utils import bedrock_model_reaches_converse_by_default
 from litellm.llms.bigmodel.common_utils import raise_bigmodel_business_error
 from litellm.types.utils import LlmProviders
@@ -3045,6 +3046,7 @@ def exception_type(
                 )
     except Exception as e:
         carry_agentic_followup_mark(source=original_exception, mapped=e)
+        carry_unusable_tool_call_mark(source=original_exception, mapped=e)
         # LOGGING
         exception_logging(
             logger_fn=None,
@@ -3076,6 +3078,7 @@ def exception_type(
             _attach_debug_info(raised_exc, request_debug_info)
             setattr(raised_exc, "litellm_response_headers", litellm_response_headers)
             carry_agentic_followup_mark(source=original_exception, mapped=raised_exc)
+            carry_unusable_tool_call_mark(source=original_exception, mapped=raised_exc)
             raise raised_exc
 
 

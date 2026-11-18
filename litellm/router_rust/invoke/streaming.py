@@ -70,6 +70,7 @@ from litellm.litellm_core_utils.core_helpers import FinishEvidence, as_str_mappi
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, get_hidden_params, set_hidden_params
 from litellm.litellm_core_utils.on_end_byte_stream import StreamClosedEarly, StreamCompleted, StreamEnd, StreamFailed
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.litellm_core_utils.unusable_tool_call_failure import is_unusable_tool_call_failure
 from litellm.llms.custom_httpx.stream_close import aclose_if_supported
 from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.router_rust.invoke.slots import hold_slot_until_closed
@@ -739,6 +740,8 @@ def _mid_stream_continuation_eligible(
     if not e.generated_content or e.emitted_disqualifying_content:
         return False
     if isinstance(e.original_exception, litellm_exceptions.ContentPolicyViolationError):
+        return False
+    if is_unusable_tool_call_failure(e):
         return False
     if isinstance(cut_deployment_id, str) and not core.registry().has_deployment(cut_deployment_id):
         return False
@@ -1936,6 +1939,8 @@ def _responses_continuation_request(
     if _mid_stream_error_before_output(e):
         return None
     if isinstance(e.original_exception, litellm_exceptions.ContentPolicyViolationError):
+        _raise_original_mid_stream_error(e)
+    if is_unusable_tool_call_failure(e):
         _raise_original_mid_stream_error(e)
     cut_deployment_id: Final = (get_hidden_params(source_iterator) or {}).get("model_id")
     if constrains_responses_continuation(_params_sent_to_deployment(attempt, cut_deployment_id)):

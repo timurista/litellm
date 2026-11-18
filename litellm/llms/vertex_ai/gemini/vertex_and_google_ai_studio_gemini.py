@@ -44,6 +44,7 @@ from litellm.litellm_core_utils.tool_fields import (
     qualified_member_name,
     tool_params_without_hosted_mcp,
 )
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.llms.base_llm.chat.transformation import BaseConfig, BaseLLMException
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
@@ -131,8 +132,8 @@ from .long_decode import (
     LongDecodeHops,
     StreamResume,
     SyncStreamResume,
-    _asks_for_one_candidate,
     answer_bytes,
+    asks_for_one_candidate,
     client_continuation_token,
     collect_hops_async,
     collect_hops_sync,
@@ -4201,7 +4202,14 @@ def _transform_long_decode_hops(
     return merged if marked is merged_usage else merged.model_copy(update={"usage": marked})
 
 
-_FAILED_TOOL_CALL_FINISH_REASONS: Final = frozenset({"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"})
+_FAILED_TOOL_CALL_FINISH_REASONS: Final[frozenset[GeminiFinishReason]] = frozenset(
+    {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"}
+)
+
+
+def _stream_fails_on_unusable_tool_call(resume: StreamResume | None) -> bool:
+    """Only a live request can fail: pass-through logging replays a finished stream and has no resume."""
+    return resume is not None and asks_for_one_candidate(resume.request_body.get("generationConfig") or {})
 
 
 def _clear_finish_fields(choices: Sequence["StreamingChoices"]) -> None:
@@ -4258,10 +4266,8 @@ class ModelResponseIterator:
         self.has_seen_tool_calls: bool = False
         self._resume = resume
         self._output_cap = continuation_cap_of(resume.request_body) if resume is not None else None
-        self._asked_for_one_candidate: Final = resume is not None and _asks_for_one_candidate(
-            resume.request_body.get("generationConfig") or {}
-        )
-        self._failed_tool_call_reason: str | None = None
+        self._fails_on_unusable_tool_call: Final = _stream_fails_on_unusable_tool_call(resume)
+        self._failed_tool_call_reason: GeminiFinishReason | None = None
         self._pending_hop_token: str | None = None
         self._unanswered_hop_token: str | None = None
         self._first_response_id: str | None = None
@@ -4392,28 +4398,33 @@ class ModelResponseIterator:
         if self.has_seen_tool_calls:
             self._failed_tool_call_reason = None
             return
-        if not self._asked_for_one_candidate or len(candidates) != 1 or not _names_its_finish(candidates[0]):
+        if not self._fails_on_unusable_tool_call or not _names_its_finish(candidates[0]):
             return
         reason: Final = candidates[0].get("finishReason")
-        if reason is None or reason not in _FAILED_TOOL_CALL_FINISH_REASONS:
+        if reason not in _FAILED_TOOL_CALL_FINISH_REASONS:
             self._failed_tool_call_reason = None
             return
         self._failed_tool_call_reason = reason
         _clear_finish_fields(model_response.choices)
 
-    def _next_hop_token_at_stream_end(self) -> str | None:
+    def _take_pending_hop_token(self) -> str | None:
         token: Final = self._pending_hop_token
-        if token is not None:
-            self._pending_hop_token = None
-            self._failed_tool_call_reason = None
-            return token
-        if self._failed_tool_call_reason is not None:
-            raise VertexAIError(
-                status_code=500,
-                message=f"Gemini ended the stream with finish reason {self._failed_tool_call_reason} "
-                "instead of a usable tool call",
-            )
-        return None
+        if token is None:
+            return None
+        self._pending_hop_token = None
+        self._failed_tool_call_reason = None
+        return token
+
+    def _raise_if_stream_ended_on_failed_tool_call(self) -> None:
+        if self._failed_tool_call_reason is None:
+            return
+        error: Final = VertexAIError(
+            status_code=500,
+            message=f"Gemini ended the stream with finish reason {self._failed_tool_call_reason} "
+            "instead of a usable tool call",
+        )
+        mark_unusable_tool_call_failure(error)
+        raise error
 
     def _marked_stream_usage(self, usage: Usage | None) -> Usage | None:
         if usage is None or not self._usage_offset:
@@ -4715,7 +4726,8 @@ class ModelResponseIterator:
                         return result
                 if (unanswered_end := self._end_of_unanswered_hop()) is not None:
                     return unanswered_end
-                if (token := self._next_hop_token_at_stream_end()) is None:
+                if (token := self._take_pending_hop_token()) is None:
+                    self._raise_if_stream_ended_on_failed_tool_call()
                     raise StopIteration
                 if (truncated_end := self._open_next_hop_sync(token)) is not None:
                     return truncated_end
@@ -4755,7 +4767,8 @@ class ModelResponseIterator:
                         return result
                 if (unanswered_end := self._end_of_unanswered_hop()) is not None:
                     return unanswered_end
-                if (token := self._next_hop_token_at_stream_end()) is None:
+                if (token := self._take_pending_hop_token()) is None:
+                    self._raise_if_stream_ended_on_failed_tool_call()
                     raise StopAsyncIteration
                 if (truncated_end := await self._open_next_hop_async(token)) is not None:
                     return truncated_end
