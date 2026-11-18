@@ -21,6 +21,7 @@ from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
     CLI_SESSION_KEY_PREFIX,
     EMPTY_MAPPING,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     KUBERNETES_POD_ROUTING_KEY,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
     LITELLM_TRUNCATED_PAYLOAD_FIELD,
@@ -31,6 +32,7 @@ from litellm.constants import (
     MAX_STRING_LENGTH_COMPACTION_SUMMARY_IN_DB,
     MCP_SPEND_LOG_MODEL_PREFIX,
     REDACTED_BY_LITELM_STRING,
+    ROUTE_CALL_TYPE_METADATA_KEY,
     SESSION_ID_OMITTED_METADATA_KEY,
     UNKNOWN_MODEL_SPEND_LOG_MODEL,
 )
@@ -39,6 +41,7 @@ from litellm.constants import (
 )
 from litellm.integrations.otel.model.metadata import caller_session_id
 from litellm.integrations.otel.model.trace_controls import TraceControls, caller_trace_controls
+from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.litellm_core_utils.batch_utils import (
     BATCH_COST_REQUEST_ID_SUFFIX,
     charged_poll_cost,
@@ -216,6 +219,7 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
         "litellm_roi_estimator",
         "is_silent_experiment",
         BILLED_RETRY_ATTEMPT_METADATA_KEY,
+        ROUTE_CALL_TYPE_METADATA_KEY,
         "user_api_key_user_email",
         "user_api_key_customer_org_id",
         "user_api_key_app_id",
@@ -231,6 +235,25 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
 
 class _UpstreamProviderMetadata(TypedDict, total=False):
     upstream_provider: ReadOnly[str]
+
+
+class _RouteCallTypeMetadata(TypedDict, total=False):
+    route_call_type: ReadOnly[str]
+
+
+_GENERATE_CONTENT_CALL_TYPES: Final = frozenset({CallTypes.agenerate_content, CallTypes.agenerate_content_stream})
+
+
+def _adapter_route_call_type(call_type: object, metadata: Mapping[str, object]) -> str | None:
+    route: Final = metadata.get("user_api_key_request_route")
+    if (
+        call_type != CallTypes.acompletion.value
+        or not isinstance(route, str)
+        or metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY)
+    ):
+        return None
+    served: Final = next(iter(get_call_types_for_route(route) or ()), None)
+    return served.value if served in _GENERATE_CONTENT_CALL_TYPES else None
 
 
 def _stored_user_email(metadata: Mapping[str, object]) -> str | None:
@@ -288,9 +311,13 @@ def _get_spend_logs_metadata(
     used_client_oauth_token: bool | None = None,
     kubernetes_pod_routing: StandardLoggingKubernetesPodRouting | None = None,
     is_silent_experiment: bool = False,
+    route_call_type: str | None = None,
 ) -> SpendLogsMetadata:
     upstream_provider_metadata: Final[_UpstreamProviderMetadata] = (
         {"upstream_provider": upstream_provider} if upstream_provider is not None else {}
+    )
+    route_call_type_metadata: Final[_RouteCallTypeMetadata] = (
+        {"route_call_type": route_call_type} if route_call_type is not None else {}
     )
     if metadata is None:
         return SpendLogsMetadata(
@@ -354,6 +381,7 @@ def _get_spend_logs_metadata(
         ),
         **_stored_customer_identity(customer_metadata),
         **upstream_provider_metadata,
+        **route_call_type_metadata,
         autorouter_savings=autorouter_savings,
         autorouter_savings_estimate=autorouter_savings_estimate,
         autorouter_baseline_observation=autorouter_baseline_observation,
@@ -970,6 +998,7 @@ def get_logging_payload(
             proxy_stamped_used_client_oauth_token(litellm_params.get("metadata"), litellm_params), custom_llm_provider
         ),
         kubernetes_pod_routing=kubernetes_pod_routing,
+        route_call_type=_adapter_route_call_type(call_type, metadata),
         azure_spillover=azure_spillover(
             response_headers=kwargs.get("response_headers")
             if isinstance(kwargs.get("response_headers"), Mapping)
