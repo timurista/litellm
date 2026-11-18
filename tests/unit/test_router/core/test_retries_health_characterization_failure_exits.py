@@ -75,7 +75,7 @@ def wrapped_unusable_tool_call_failure() -> MidStreamFallbackError:
 
 def server_error_worded_like_a_tool_call_failure() -> litellm.InternalServerError:
     return litellm.InternalServerError(
-        message="Gemini ended the stream with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
+        message="Gemini ended the response with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
         llm_provider="vertex_ai",
         model="gemini-3.8-flash",
     )

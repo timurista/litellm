@@ -169,7 +169,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-    from litellm.types.utils import ModelResponseStream, StreamingChoices
+    from litellm.types.utils import Delta, Message, ModelResponseStream, StreamingChoices
 
     LoggingClass = LiteLLMLoggingObj
 else:
@@ -4195,11 +4195,21 @@ def _transform_long_decode_hops(
         logging_obj=logging_obj,
         raw_response=first_response,
     )
-    merged_usage: Final = getattr(merged, "usage", None)
-    if not isinstance(merged_usage, Usage):
-        return merged
-    marked: Final = with_initial_prompt_tokens(merged_usage, initial_prompt_tokens_of(hops))
-    return merged if marked is merged_usage else merged.model_copy(update={"usage": marked})
+    finished: Final = _with_first_hop_prompt_tokens(merged, hops)
+    failed_reason: Final = _response_failed_tool_call_reason(body, request_body, finished)
+    if failed_reason is None:
+        return finished
+    served: Final = logging_obj.served_round(finished)
+    logging_obj.record_served_rounds_for_failure(() if served is None else (served,))
+    raise _unusable_tool_call_error(failed_reason)
+
+
+def _with_first_hop_prompt_tokens(response: ModelResponse, hops: LongDecodeHops) -> ModelResponse:
+    usage: Final = getattr(response, "usage", None)
+    if not isinstance(usage, Usage):
+        return response
+    marked: Final = with_initial_prompt_tokens(usage, initial_prompt_tokens_of(hops))
+    return response if marked is usage else response.model_copy(update={"usage": marked})
 
 
 _FAILED_TOOL_CALL_FINISH_REASONS: Final[frozenset[GeminiFinishReason]] = frozenset(
@@ -4207,9 +4217,43 @@ _FAILED_TOOL_CALL_FINISH_REASONS: Final[frozenset[GeminiFinishReason]] = frozens
 )
 
 
+def _requests_one_candidate(request_body: RequestBody) -> bool:
+    return asks_for_one_candidate(request_body.get("generationConfig") or {})
+
+
+def _calls_a_tool(message: "Message | Delta") -> bool:
+    return bool(message.tool_calls or message.function_call)
+
+
+def _failed_tool_call_reason(candidate: Candidates, called_a_tool: bool) -> GeminiFinishReason | None:
+    reason: Final = candidate.get("finishReason")
+    return reason if not called_a_tool and reason in _FAILED_TOOL_CALL_FINISH_REASONS else None
+
+
+def _unusable_tool_call_error(reason: GeminiFinishReason) -> VertexAIError:
+    error: Final = VertexAIError(
+        status_code=500,
+        message=f"Gemini ended the response with finish reason {reason} instead of a usable tool call",
+    )
+    mark_unusable_tool_call_failure(error)
+    return error
+
+
+def _response_failed_tool_call_reason(
+    body: GenerateContentResponseBody, request_body: RequestBody, response: ModelResponse
+) -> GeminiFinishReason | None:
+    candidates: Final = body.get("candidates")
+    if not candidates or not _requests_one_candidate(request_body):
+        return None
+    called_a_tool: Final = any(
+        _calls_a_tool(choice.message) for choice in response.choices if isinstance(choice, litellm.Choices)
+    )
+    return _failed_tool_call_reason(candidates[0], called_a_tool)
+
+
 def _stream_fails_on_unusable_tool_call(resume: StreamResume | None) -> bool:
     """Only a live request can fail: pass-through logging replays a finished stream and has no resume."""
-    return resume is not None and asks_for_one_candidate(resume.request_body.get("generationConfig") or {})
+    return resume is not None and _requests_one_candidate(resume.request_body)
 
 
 def _clear_finish_fields(choices: Sequence["StreamingChoices"]) -> None:
@@ -4268,6 +4312,7 @@ class ModelResponseIterator:
         self._output_cap = continuation_cap_of(resume.request_body) if resume is not None else None
         self._fails_on_unusable_tool_call: Final = _stream_fails_on_unusable_tool_call(resume)
         self._failed_tool_call_reason: GeminiFinishReason | None = None
+        self._saw_tool_call: bool = False
         self._pending_hop_token: str | None = None
         self._unanswered_hop_token: str | None = None
         self._first_response_id: str | None = None
@@ -4395,17 +4440,16 @@ class ModelResponseIterator:
     def _hold_back_failed_tool_call_finish(
         self, candidates: Sequence[Candidates], model_response: "ModelResponseStream"
     ) -> None:
-        if self.has_seen_tool_calls:
-            self._failed_tool_call_reason = None
+        if not self._fails_on_unusable_tool_call:
             return
-        if not self._fails_on_unusable_tool_call or not _names_its_finish(candidates[0]):
+        self._saw_tool_call = self._saw_tool_call or any(
+            _calls_a_tool(choice.delta) for choice in model_response.choices
+        )
+        if not self._saw_tool_call and not _names_its_finish(candidates[0]):
             return
-        reason: Final = candidates[0].get("finishReason")
-        if reason not in _FAILED_TOOL_CALL_FINISH_REASONS:
-            self._failed_tool_call_reason = None
-            return
-        self._failed_tool_call_reason = reason
-        _clear_finish_fields(model_response.choices)
+        self._failed_tool_call_reason = _failed_tool_call_reason(candidates[0], self._saw_tool_call)
+        if self._failed_tool_call_reason is not None:
+            _clear_finish_fields(model_response.choices)
 
     def _take_pending_hop_token(self) -> str | None:
         token: Final = self._pending_hop_token
@@ -4416,15 +4460,8 @@ class ModelResponseIterator:
         return token
 
     def _raise_if_stream_ended_on_failed_tool_call(self) -> None:
-        if self._failed_tool_call_reason is None:
-            return
-        error: Final = VertexAIError(
-            status_code=500,
-            message=f"Gemini ended the stream with finish reason {self._failed_tool_call_reason} "
-            "instead of a usable tool call",
-        )
-        mark_unusable_tool_call_failure(error)
-        raise error
+        if self._failed_tool_call_reason is not None:
+            raise _unusable_tool_call_error(self._failed_tool_call_reason)
 
     def _marked_stream_usage(self, usage: Usage | None) -> Usage | None:
         if usage is None or not self._usage_offset:

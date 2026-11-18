@@ -6,7 +6,7 @@ _MARK_ATTRIBUTE: Final = "_litellm_unusable_tool_call_failure"
 
 
 def mark_unusable_tool_call_failure(error: BaseException) -> None:
-    """Tag a stream that ended on a tool call the model could not produce: the request and the model's
+    """Tag a response that ended on a tool call the model could not produce: the request and the model's
     output caused it, so the deployment that served it stays healthy."""
     setattr(error, _MARK_ATTRIBUTE, True)
 

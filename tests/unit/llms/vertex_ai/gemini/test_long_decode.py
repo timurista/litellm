@@ -2,6 +2,7 @@ import json
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import chain, repeat
 from typing import Final
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 import litellm
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.vertex_ai.gemini.long_decode import (
     collect_hops_async,
@@ -141,6 +143,49 @@ async def test_unary_long_decode_resends_the_original_request_with_the_token_and
     assert response.usage.completion_tokens == 50
     assert response.usage.prompt_tokens_details.cached_tokens == 9
     assert response.usage.prompt_tokens_details.initial_prompt_tokens == 10
+
+
+@pytest.mark.parametrize(
+    ("hop_count", "prompt_tokens", "completion_tokens"),
+    [(1, 10, 20), (2, 20, 50)],
+    ids=["one_request", "continued"],
+)
+@pytest.mark.parametrize("is_async", [True, False])
+@pytest.mark.asyncio
+async def test_unary_failed_tool_call_keeps_every_hops_usage_and_cost_on_the_failure_log(
+    is_async: bool, hop_count: int, prompt_tokens: int, completion_tokens: int
+):
+    failed: Final = _ending_with(HOP_2, "MALFORMED_FUNCTION_CALL")
+    bodies: Final = (HOP_1, failed)[-hop_count:]
+    sent: Final[list[dict[str, object]]] = []
+    transport: Final = httpx.MockTransport(_replay(tuple(httpx.Response(200, json=body) for body in bodies), sent))
+    logging_obj: Final = Logging(
+        model=MODEL,
+        messages=list(MESSAGES),
+        stream=False,
+        call_type="acompletion" if is_async else "completion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="failed-tool-call",
+        function_id="failed-tool-call",
+    )
+    kwargs: Final = {
+        "model": MODEL,
+        "messages": list(MESSAGES),
+        "max_tokens": 100_000,
+        "api_key": "fake-gemini-key",
+        "litellm_logging_obj": logging_obj,
+    }
+
+    with pytest.raises(litellm.InternalServerError):
+        if is_async:
+            await litellm.acompletion(**kwargs, client=AsyncHTTPHandler(transport=transport))
+        else:
+            litellm.completion(**kwargs, client=HTTPHandler(client=httpx.Client(transport=transport)))
+
+    usage: Final = logging_obj.model_call_details["combined_usage_object"]
+    assert len(sent) == hop_count
+    assert (usage.prompt_tokens, usage.completion_tokens) == (prompt_tokens, completion_tokens)
+    assert logging_obj.model_call_details["response_cost"] > 0
 
 
 @pytest.mark.parametrize("is_async", [True, False])

@@ -1350,7 +1350,7 @@ def test_cooldown_logic_skips_only_a_marked_tool_call_failure(marked: bool, runs
         ]
     )
     error: Final = litellm.InternalServerError(
-        message="Gemini ended the stream with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
+        message="Gemini ended the response with finish reason MALFORMED_FUNCTION_CALL instead of a usable tool call",
         llm_provider="vertex_ai",
         model="gemini-3.8-flash",
     )

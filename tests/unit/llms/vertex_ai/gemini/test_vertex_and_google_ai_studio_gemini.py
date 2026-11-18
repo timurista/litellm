@@ -12015,6 +12015,7 @@ async def _drain_gemini_stream(
     is_async: bool,
     generation_config: Mapping[str, int] | None = None,
     hop_frames: Sequence[Mapping[str, object]] = (),
+    optional_params: Mapping[str, object] | None = None,
 ) -> _GeminiStreamEnd:
     lines: Final = tuple(f"data: {json.dumps(frame)}" for frame in frames)
     request_body: Final = RequestBody(contents=[], generationConfig=dict(generation_config or {}))
@@ -12025,7 +12026,7 @@ async def _drain_gemini_stream(
     iterator: Final = ModelResponseIterator(
         streaming_response=_async_lines(lines) if is_async else iter(lines),
         sync_stream=not is_async,
-        logging_obj=MagicMock(optional_params={}),
+        logging_obj=MagicMock(optional_params=dict(optional_params or {})),
         resume=(
             AsyncStreamResume(request_body=request_body, open_hop=open_hop_async)
             if is_async
@@ -12194,3 +12195,97 @@ async def test_tool_call_failure_in_a_continuation_hop_still_raises(is_async: bo
 
     assert isinstance(end.error, VertexAIError)
     assert _streamed_text(end.chunks) == "Waves fold silver light."
+
+
+@_STREAM_MODES
+async def test_legacy_function_call_followed_by_failed_reason_does_not_raise(is_async: bool) -> None:
+    end: Final = await _drain_gemini_stream(
+        (_TOOL_CALL_FRAME, _google_finished({"finishReason": "MALFORMED_FUNCTION_CALL"})),
+        is_async,
+        optional_params={"functions": [{"name": "lookup"}]},
+    )
+
+    assert end.error is None
+    assert end.chunks[0].choices[0].delta.function_call is not None
+
+
+async def _complete_google_document(document: Mapping[str, object], is_async: bool, **request: object) -> ModelResponse:
+    transport: Final = httpx.MockTransport(lambda _: httpx.Response(200, json=dict(document)))
+    call: Final = {
+        "model": "gemini/gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Describe the sea."}],
+        "api_key": "fake-gemini-key",
+        **request,
+    }
+    if is_async:
+        return await litellm.acompletion(**call, client=AsyncHTTPHandler(transport=transport))
+    return litellm.completion(**call, client=HTTPHandler(client=httpx.Client(transport=transport)))
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", _FAILED_TOOL_CALL_REASONS)
+async def test_non_streamed_failed_tool_call_raises_a_marked_500_without_the_text(reason: str, is_async: bool) -> None:
+    with pytest.raises(litellm.InternalServerError) as raised:
+        await _complete_google_document(_google_last_frame(reason), is_async)
+
+    assert raised.value.status_code == 500
+    assert reason in str(raised.value)
+    assert _FAILED_TOOL_CALL_NOTE not in str(raised.value)
+    assert "silver light." not in str(raised.value)
+    assert is_unusable_tool_call_failure(raised.value)
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", _FAILED_TOOL_CALL_REASONS)
+async def test_non_streamed_tool_call_with_a_failed_reason_is_returned(reason: str, is_async: bool) -> None:
+    candidate: Final = {**_TOOL_CALL_FRAME["candidates"][0], "finishReason": reason}
+
+    response: Final = await _complete_google_document(_google_finished(candidate), is_async)
+
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert response.choices[0].message.tool_calls[0].function.name == "lookup"
+
+
+@_STREAM_MODES
+async def test_non_streamed_legacy_function_call_with_a_failed_reason_is_returned(is_async: bool) -> None:
+    candidate: Final = {**_TOOL_CALL_FRAME["candidates"][0], "finishReason": "MALFORMED_FUNCTION_CALL"}
+
+    response: Final = await _complete_google_document(
+        _google_finished(candidate),
+        is_async,
+        functions=[{"name": "lookup", "parameters": {"type": "object", "properties": {}}}],
+    )
+
+    assert response.choices[0].finish_reason == "function_call"
+    assert response.choices[0].message.function_call.name == "lookup"
+
+
+@_STREAM_MODES
+@pytest.mark.parametrize("reason", ["MALFORMED_RESPONSE", "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "STOP"])
+async def test_non_streamed_other_finish_reasons_return_the_answer(reason: str, is_async: bool) -> None:
+    response: Final = await _complete_google_document(_google_last_frame(reason), is_async)
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "silver light."
+
+
+@_STREAM_MODES
+async def test_non_streamed_request_for_several_candidates_returns_the_answer(is_async: bool) -> None:
+    response: Final = await _complete_google_document(_FAILED_TOOL_CALL_FRAME, is_async, n=2)
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "silver light."
+
+
+@pytest.mark.parametrize("reason", _FAILED_TOOL_CALL_REASONS)
+def test_shared_response_transform_used_by_batch_keeps_a_failed_tool_call_as_a_stop(reason: str) -> None:
+    response: Final = VertexGeminiConfig().transform_google_generate_content_to_openai_model_response(
+        completion_response=_google_last_frame(reason),
+        model_response=ModelResponse(),
+        model="gemini-3.8-flash",
+        logging_obj=MagicMock(optional_params={}),
+        raw_response=MagicMock(headers={}),
+    )
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "silver light."
